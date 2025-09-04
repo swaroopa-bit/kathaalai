@@ -1,0 +1,255 @@
+# app.py
+import os
+import re
+import requests
+import streamlit as st
+from gtts import gTTS
+from pydub import AudioSegment, effects
+
+# ---------- Configuration ----------
+OUTPUT_DIR = "output"
+SOUNDS_DIR = "sounds"
+HF_MODEL = "ibm-granite/granite-7b-instruct"  # IBM Granite on Hugging 
+Face
+HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+# Read HF token from environment variable HF_TOKEN (recommended)
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+
+# ensure output dir exists
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(SOUNDS_DIR, exist_ok=True)  # doesn't overwrite if exists
+
+# ---------- Helper functions ----------
+def generate_voice_gtts(text, lang="en", filename=None):
+    """Generate TTS using gTTS and save to filename (mp3). Return path or 
+None."""
+    if not text or not text.strip():
+        return None
+    if filename is None:
+        filename = os.path.join(OUTPUT_DIR, "voice.mp3")
+    try:
+        tts = gTTS(text=text, lang=lang)
+        tts.save(filename)
+        return filename
+    except Exception as e:
+        st.error(f"TTS error: {e}")
+        return None
+
+def detect_mood(text):
+    t = text.lower()
+    if any(k in t for k in ["dark", "storm", "thunder", "scary", 
+"night"]):
+        return os.path.join(SOUNDS_DIR, "thunder.mp3")
+    if any(k in t for k in ["forest", "tree", "nature", "birds"]):
+        return os.path.join(SOUNDS_DIR, "forest.mp3")
+    if any(k in t for k in ["coffee", "cafe", "relax", "chill"]):
+        return os.path.join(SOUNDS_DIR, "cafe.mp3")
+    return None
+
+def add_background(narration_file, bg_file, output_file=None):
+    """Mix narration with background audio. Returns final file path."""
+    if not output_file:
+        output_file = os.path.join(OUTPUT_DIR, "final_with_bg.mp3")
+    try:
+        narration = AudioSegment.from_file(narration_file)
+        background = AudioSegment.from_file(bg_file).apply_gain(-15)
+        # ensure background is long enough
+        if len(background) < len(narration):
+            multiplier = len(narration) // len(background) + 1
+            background = background * multiplier
+        mixed = narration.overlay(background)
+        mixed.export(output_file, format="mp3")
+        return output_file
+    except Exception as e:
+        st.error(f"Background mixing error: {e}")
+        return narration_file
+
+def speed_segment(seg, rate):
+    """Change playback speed of AudioSegment using 
+pydub.effects.speedup."""
+    if rate == 1.0:
+        return seg
+    try:
+        return effects.speedup(seg, playback_speed=rate)
+    except Exception:
+        # fallback method (change frame rate)
+        new_frame_rate = int(seg.frame_rate * rate)
+        sped = seg._spawn(seg.raw_data, overrides={"frame_rate": 
+new_frame_rate})
+        return sped.set_frame_rate(seg.frame_rate)
+
+def split_speakers_and_build(text, lang="en", rate=1.0):
+    """Story mode: generate separate TTS per line, then concatenate and 
+return final path."""
+    lines = text.split("\n")
+    segments = []
+    temp_files = []
+    for idx, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+        # if "Name: speech" format, use the speech part
+        if ":" in line:
+            _, speech = line.split(":", 1)
+            speech = speech.strip()
+        else:
+            speech = line
+        filename = os.path.join(OUTPUT_DIR, f"seg_{idx}.mp3")
+        path = generate_voice_gtts(speech, lang=lang, filename=filename)
+        if path:
+            seg = AudioSegment.from_file(path)
+            seg = speed_segment(seg, rate)
+            segments.append(seg)
+            temp_files.append(path)
+    if not segments:
+        return None
+    combined = segments[0]
+    for seg in segments[1:]:
+        combined += seg
+    out_path = os.path.join(OUTPUT_DIR, "story_output.mp3")
+    combined.export(out_path, format="mp3")
+    return out_path
+
+def call_hf_granite(prompt, max_tokens=200):
+    """Call Hugging Face inference API for IBM Granite text generation."""
+    if not HF_TOKEN:
+        return "Hugging Face token missing. Set HF_TOKEN environment 
+variable first."
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": 
+max_tokens}}
+    try:
+        resp = requests.post(HF_API_URL, headers=HF_HEADERS, json=payload, 
+timeout=60)
+    except Exception as e:
+        return f"Request error: {e}"
+    if resp.status_code != 200:
+        # return error text
+        try:
+            return f"Model error {resp.status_code}: {resp.text}"
+        except Exception:
+            return f"Model error {resp.status_code}"
+    # parse response
+    try:
+        data = resp.json()
+        # common formats: {"generated_text": "..."} OR 
+[{"generated_text":"..."}]
+        if isinstance(data, dict) and "generated_text" in data:
+            return data["generated_text"]
+        if isinstance(data, list) and len(data) > 0 and "generated_text" 
+in data[0]:
+            return data[0]["generated_text"]
+        # otherwise return raw text
+        return resp.text
+    except Exception:
+        return resp.text
+
+# ---------- Streamlit UI (triple-quoted strings used where appropriate) 
+----------
+st.set_page_config(page_title="EchoVerse 2.0", layout="wide")
+st.title("""🎙️ EchoVerse 2.0
+Audiobook narrator • Story mode • Study mode • Mood background • IBM 
+Granite (via Hugging Face)""")
+
+# Mode selection
+mode = st.selectbox("Choose feature / mode:", ["Normal", "Study", "Story", 
+"IBM Study Assistant"])
+
+# Common controls
+if mode in ("Normal", "Study", "Story"):
+    text_input = st.text_area("Enter text for narration (for Story mode 
+use 'Name: speech' per line):",
+                              height=200,
+                              placeholder="Alice: Hello\nBob: Hi 
+Alice\nNarrator: The forest was quiet...")
+    lang = st.selectbox("Language (gTTS):", ["en", "es", "fr", "hi"])
+    rate = st.slider("Narration speed (1.0 = normal):", 0.5, 2.0, 1.0)
+    use_auto_bg = st.checkbox("Auto-detect mood and add background 
+(forest/thunder/cafe)?")
+    manual_bg = None
+    if not use_auto_bg:
+        manual_bg = st.selectbox("Or pick a background (must exist in 
+sounds/):", ["None", "forest.mp3", "thunder.mp3", "cafe.mp3"])
+    generate_btn = st.button("Generate Narration")
+
+if mode == "IBM Study Assistant":
+    st.write("""Use the IBM Granite model (hosted on Hugging Face) to 
+summarize, explain, or
+ask study questions. This counts as IBM tool usage in your project.""")
+    prompt = st.text_area("Enter question or text to summarize:", 
+height=160,
+                         placeholder="Explain Ohm's Law in simple 
+terms...")
+    hf_max_tokens = st.slider("Max tokens for Granite response:", 50, 400, 
+180)
+    ask_btn = st.button("Ask IBM Granite")
+
+# ---------- Button actions ----------
+if mode in ("Normal", "Study", "Story") and generate_btn:
+    if not text_input or not text_input.strip():
+        st.error("Please enter text to generate narration.")
+    else:
+        st.info("Generating narration... please wait.")
+        output_file = None
+        if mode == "Story":
+            output_file = split_speakers_and_build(text_input, lang=lang, 
+rate=rate)
+            if not output_file:
+                st.error("No dialogue lines found in Story mode. Use 
+'Name: speech' lines.")
+        else:
+            # Study: expand basic formulas to words for clearer 
+pronunciation
+            processed = text_input
+            if mode == "Study":
+                processed = re.sub(r"=", " equals ", processed)
+            voice_path = generate_voice_gtts(processed, lang=lang, 
+filename=os.path.join(OUTPUT_DIR, "narration.mp3"))
+            if not voice_path:
+                st.error("Failed to generate voice.")
+            else:
+                # apply speed if needed
+                seg = AudioSegment.from_file(voice_path)
+                seg = speed_segment(seg, rate)
+                outp = os.path.join(OUTPUT_DIR, "narration_sped.mp3")
+                seg.export(outp, format="mp3")
+                output_file = outp
+
+        # background handling
+        if output_file:
+            bg_to_use = None
+            if use_auto_bg:
+                bg_to_use = detect_mood(text_input)
+            else:
+                if manual_bg and manual_bg != "None":
+                    bg_to_use = os.path.join(SOUNDS_DIR, manual_bg)
+            if bg_to_use and os.path.exists(bg_to_use):
+                final = add_background(output_file, bg_to_use, 
+output_file=os.path.join(OUTPUT_DIR, "final_with_bg.mp3"))
+                output_file = final
+
+        if output_file and os.path.exists(output_file):
+            audio_bytes = open(output_file, "rb").read()
+            st.audio(audio_bytes, format="audio/mp3")
+            st.download_button("💾 Download Narration", audio_bytes, 
+file_name=os.path.basename(output_file))
+            st.success("Narration ready.")
+        else:
+            st.error("Failed to produce output file. Check 
+console/errors.")
+
+if mode == "IBM Study Assistant" and ask_btn:
+    if not prompt or not prompt.strip():
+        st.error("Please enter a question or text for the IBM Granite 
+assistant.")
+    else:
+        if not HF_TOKEN:
+            st.error("Hugging Face token missing. Set HF_TOKEN environment 
+variable (see instructions).")
+        else:
+            st.info("Querying IBM Granite (Hugging Face)... this may take 
+a few seconds.")
+            result = call_hf_granite(prompt, max_tokens=hf_max_tokens)
+            st.markdown("**IBM Granite Response:**")
+            st.write(result)
+
